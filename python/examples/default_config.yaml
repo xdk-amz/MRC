@@ -1,0 +1,58 @@
+global:
+  seed: 42
+  events: 1000000
+  keyspace: 1000000
+  chunk_size: 100000
+  capacity_points: 1001
+
+value_sizes:
+  mode: deterministic_heavy_tail
+  small_probability: 0.75
+  medium_probability: 0.20
+  large_probability: 0.05
+  small_sizes: [128, 256, 384, 512, 640, 768, 896, 1024]
+  medium_sizes: [2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384]
+  large_sizes: [65536, 131072, 196608, 262144, 327680, 393216, 458752, 524288]
+
+workloads:
+  uniform_random:
+    enabled: true
+  moving_hot_window:
+    enabled: true
+    window_size: 50000
+    move_every_events: 1000
+    window_step: 500
+    hot_probability: 0.95
+  stable_zipfian_hot_set:
+    enabled: true
+    zipf_alpha: 1.05
+  stable_hot_set_plus_scans:
+    enabled: true
+    hot_keyspace: 20000
+    hot_zipf_alpha: 1.15
+    period_events: 100000
+    scan_events_per_period: 20000
+    scan_start_key: 200000
+  rotating_hot_sets:
+    enabled: true
+    phase_len_events: 100000
+    phases: 8
+    hotset_size: 50000
+    hot_probability: 0.9
+  hot_core_noisy_tail:
+    enabled: true
+    core_keyspace: 10000
+    core_zipf_alpha: 1.2
+    core_probability: 0.7
+    tail_start_key: 100000
+  size_skewed:
+    enabled: true
+    zipf_alpha: 1.05
+  read_churn_hot_region:
+    enabled: true
+    refresh_every_events: 25000
+    hotset_size: 25000
+    hot_probability: 0.85
+  sequential_scan:
+    enabled: true
+    scan_size: 100000

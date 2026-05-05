@@ -1,0 +1,35 @@
+# Generated artifacts
+data/
+results/
+runs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.numba_cache/
+.tox/
+.cache/
+
+# Build
+build/
+dist/
+rust/target/
+
+# Output data
+out/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
