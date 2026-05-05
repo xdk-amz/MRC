@@ -256,7 +256,7 @@ WORKLOADS: dict[str, Callable[[GenContext, dict], tuple[np.ndarray, np.ndarray]]
 # Trace I/O
 # ---------------------------------------------------------------------------
 
-TRACE_COLUMNS = ["t", "op", "key", "value_size", "workload_label"]
+TRACE_COLUMNS = ["t", "op", "key", "key_size", "value_size", "workload_label"]
 
 
 def _derive_workload_seed(global_seed: int, name: str) -> int:
@@ -288,6 +288,11 @@ def generate_trace(
     keys, labels = WORKLOADS[name](ctx, params)
     keys = np.asarray(keys, dtype=np.int64)
     sizes = value_sizes_for_keys(keys, cfg.value_sizes)
+    # Compute key sizes from key:value ratio
+    ratio_parts = cfg.value_sizes.key_value_ratio.split(":")
+    k_ratio = int(ratio_parts[0])
+    v_ratio = int(ratio_parts[1])
+    key_sizes = np.maximum(1, (sizes * k_ratio // v_ratio)).astype(np.int64)
     t = np.arange(events, dtype=np.int64)
     op = np.full(events, "GET", dtype=object)
     df = pd.DataFrame(
@@ -295,6 +300,7 @@ def generate_trace(
             "t": t,
             "op": op,
             "key": keys,
+            "key_size": key_sizes,
             "value_size": sizes,
             "workload_label": labels,
         },

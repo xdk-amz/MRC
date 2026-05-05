@@ -8,6 +8,21 @@ use std::sync::Arc;
 mod policies;
 use policies::{AllkeysLfu, AllkeysLru, AllkeysRandom, Fifo, S3Fifo, EvictionPolicy};
 
+#[derive(Clone, Copy, PartialEq)]
+enum SpillMode {
+    KeySpilling,
+    NoKeySpilling,
+}
+
+impl SpillMode {
+    fn label(&self) -> &'static str {
+        match self {
+            SpillMode::KeySpilling => "key-spilling",
+            SpillMode::NoKeySpilling => "no-key-spilling",
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "mrc-sim", about = "MRC simulator for Valkey eviction policies")]
 struct Cli {
@@ -15,7 +30,7 @@ struct Cli {
     #[arg(required = true)]
     traces: Vec<PathBuf>,
 
-    /// Policies: allkeys-lru, allkeys-lfu
+    /// Policies: allkeys-lru, allkeys-lfu, allkeys-random, fifo, s3-fifo
     #[arg(short, long, value_delimiter = ',', default_value = "allkeys-lru")]
     policy: Vec<String>,
 
@@ -26,20 +41,26 @@ struct Cli {
     /// Output directory
     #[arg(short, long, default_value = "out/valkey_mrc")]
     output: PathBuf,
+
+    /// Spill mode: key-spilling, no-key-spilling, both
+    #[arg(short, long, default_value = "both")]
+    mode: String,
 }
 
 struct Trace {
     workload: String,
     keys: Vec<u64>,
-    sizes: Vec<u64>,
-    unique_bytes: u64,
+    key_sizes: Vec<u64>,
+    value_sizes: Vec<u64>,
+    total_key_bytes: u64,
+    total_value_bytes: u64,
+    total_bytes: u64,
     n_unique: usize,
 }
 
 fn load_trace(path: &PathBuf) -> Trace {
     let workload = path.file_stem().unwrap().to_string_lossy().to_string();
 
-    // Read first line to detect format
     let first_line = {
         let file = std::fs::File::open(path).expect("cannot open trace");
         let mut reader = std::io::BufReader::new(file);
@@ -48,8 +69,11 @@ fn load_trace(path: &PathBuf) -> Trace {
         line.trim().to_string()
     };
 
-    // Skip non-CSV header lines (e.g. "OK")
-    let skip_first = !first_line.contains(',');
+    // Skip first line if it's not data (no commas, or starts with known header)
+    let skip_first = !first_line.contains(',')
+        || first_line.starts_with("t,")
+        || first_line.starts_with("ts_us,")
+        || first_line.starts_with("workload,");
 
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -58,7 +82,8 @@ fn load_trace(path: &PathBuf) -> Trace {
         .expect("cannot open trace");
 
     let mut keys = Vec::new();
-    let mut sizes = Vec::new();
+    let mut key_sizes = Vec::new();
+    let mut value_sizes = Vec::new();
     let mut key_map: FxHashMap<String, u64> = FxHashMap::default();
     let mut next_id: u64 = 0;
 
@@ -70,39 +95,60 @@ fn load_trace(path: &PathBuf) -> Trace {
         let ncols = record.len();
 
         if ncols >= 10 {
-            // New Valkey MONITOR TRACE format:
-            // ts_us, seq, db_id, cmd, key(b64), access_type, key_exists, obj_type, key_bytes, value_bytes
+            // Valkey MONITOR TRACE: ts_us, seq, db_id, cmd, key(b64), access_type, key_exists, obj_type, key_bytes, value_bytes
             let key_str = &record[4];
             let key_id = *key_map.entry(key_str.to_string()).or_insert_with(|| {
                 let id = next_id;
                 next_id += 1;
                 id
             });
-            let value_bytes: u64 = record[9].parse().unwrap_or(0);
+            let kb: u64 = record[8].parse().unwrap_or(0);
+            let vb: u64 = record[9].parse().unwrap_or(0);
             keys.push(key_id);
-            sizes.push(value_bytes);
-        } else {
-            // Old synthetic format: t, op, key(int), value_size, workload_label
+            key_sizes.push(kb);
+            value_sizes.push(vb);
+        } else if ncols >= 6 {
+            // New synthetic: t, op, key, key_size, value_size, workload_label
             keys.push(record[2].parse::<u64>().expect("bad key"));
-            sizes.push(record[3].parse::<u64>().expect("bad size"));
+            key_sizes.push(record[3].parse::<u64>().expect("bad key_size"));
+            value_sizes.push(record[4].parse::<u64>().expect("bad value_size"));
+        } else if ncols >= 5 {
+            // Old synthetic: t, op, key, value_size, workload_label (no key_size)
+            keys.push(record[2].parse::<u64>().expect("bad key"));
+            key_sizes.push(0);
+            value_sizes.push(record[3].parse::<u64>().expect("bad size"));
+        } else {
+            // Minimal: key, value_size
+            keys.push(record[0].parse::<u64>().expect("bad key"));
+            key_sizes.push(0);
+            value_sizes.push(record[1].parse::<u64>().expect("bad size"));
         }
     }
 
-    let mut first_size: FxHashMap<u64, u64> = FxHashMap::default();
+    // Compute unique key/value bytes (first occurrence of each key)
+    let mut first_key_size: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut first_value_size: FxHashMap<u64, u64> = FxHashMap::default();
     for i in 0..keys.len() {
-        first_size.entry(keys[i]).or_insert(sizes[i]);
+        first_key_size.entry(keys[i]).or_insert(key_sizes[i]);
+        first_value_size.entry(keys[i]).or_insert(value_sizes[i]);
     }
-    let unique_bytes: u64 = first_size.values().sum();
-    let n_unique = first_size.len();
-    Trace { workload, keys, sizes, unique_bytes, n_unique }
+    let total_key_bytes: u64 = first_key_size.values().sum();
+    let total_value_bytes: u64 = first_value_size.values().sum();
+    let total_bytes = total_key_bytes + total_value_bytes;
+    let n_unique = first_key_size.len();
+
+    Trace { workload, keys, key_sizes, value_sizes, total_key_bytes, total_value_bytes, total_bytes, n_unique }
 }
 
 struct TaskResult {
     workload: String,
     policy: String,
+    mode: SpillMode,
     cap_frac: f64,
     cap_bytes: u64,
-    unique_bytes: u64,
+    total_key_bytes: u64,
+    total_value_bytes: u64,
+    total_bytes: u64,
     n_unique: usize,
     total_accesses: usize,
     obj_miss_ratio: f64,
@@ -140,6 +186,7 @@ fn simulate_one(
     cap_bytes: u64,
     cap_frac: f64,
     policy_name: &str,
+    mode: SpillMode,
 ) -> TaskResult {
     let mut policy = make_policy(policy_name, cap_bytes);
 
@@ -151,17 +198,20 @@ fn simulate_one(
 
     for t in 0..trace.keys.len() {
         let k = trace.keys[t];
-        let sz = trace.sizes[t];
+        let entry_size = match mode {
+            SpillMode::KeySpilling => trace.key_sizes[t] + trace.value_sizes[t],
+            SpillMode::NoKeySpilling => trace.value_sizes[t],
+        };
         let first_touch = seen.insert(k);
-        let hit = policy.access(k, sz, t as u64);
+        let hit = policy.access(k, entry_size, t as u64);
         if first_touch {
             continue;
         }
         measured += 1;
-        measured_bytes += sz;
+        measured_bytes += trace.value_sizes[t];
         if !hit {
             obj_miss += 1;
-            byte_miss += sz;
+            byte_miss += trace.value_sizes[t];
         }
     }
 
@@ -171,9 +221,12 @@ fn simulate_one(
     TaskResult {
         workload: trace.workload.clone(),
         policy: policy_name.to_string(),
+        mode,
         cap_frac,
         cap_bytes,
-        unique_bytes: trace.unique_bytes,
+        total_key_bytes: trace.total_key_bytes,
+        total_value_bytes: trace.total_value_bytes,
+        total_bytes: trace.total_bytes,
         n_unique: trace.n_unique,
         total_accesses: trace.keys.len(),
         obj_miss_ratio,
@@ -185,7 +238,14 @@ fn main() {
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.output).unwrap();
 
-    // Validate non-parameterized policies
+    let modes: Vec<SpillMode> = match cli.mode.as_str() {
+        "key-spilling" => vec![SpillMode::KeySpilling],
+        "no-key-spilling" => vec![SpillMode::NoKeySpilling],
+        "both" => vec![SpillMode::KeySpilling, SpillMode::NoKeySpilling],
+        _ => panic!("unknown mode: {} (valid: key-spilling, no-key-spilling, both)", cli.mode),
+    };
+
+    // Validate policies
     for p in &cli.policy {
         if !p.starts_with("s3-fifo") {
             let valid = ["allkeys-lru", "allkeys-lfu", "allkeys-random", "fifo"];
@@ -193,22 +253,30 @@ fn main() {
         }
     }
 
-    // Load all traces
+    // Load traces
     let traces: Vec<Arc<Trace>> = cli.traces.iter().map(|p| {
         eprintln!("Loading {}...", p.display());
         let t = load_trace(p);
-        eprintln!("  {} events, {} unique keys, {} unique bytes", t.keys.len(), t.n_unique, t.unique_bytes);
+        eprintln!("  {} events, {} unique keys, {} key bytes, {} value bytes, {} total bytes",
+            t.keys.len(), t.n_unique, t.total_key_bytes, t.total_value_bytes, t.total_bytes);
         Arc::new(t)
     }).collect();
 
-    // Build task list: (trace_idx, policy, cap_frac, cap_bytes)
-    let mut tasks: Vec<(Arc<Trace>, String, f64, u64)> = Vec::new();
+    // Build tasks
+    let mut tasks: Vec<(Arc<Trace>, String, f64, u64, SpillMode)> = Vec::new();
     for trace in &traces {
         for policy in &cli.policy {
-            for i in 0..cli.cap_points {
-                let frac = if cli.cap_points > 1 { i as f64 / (cli.cap_points - 1) as f64 } else { 1.0 };
-                let cap_bytes = (frac * trace.unique_bytes as f64).round() as u64;
-                tasks.push((trace.clone(), policy.clone(), frac, cap_bytes));
+            for &mode in &modes {
+                // Capacity sweep range depends on mode
+                let (min_bytes, max_bytes) = match mode {
+                    SpillMode::KeySpilling => (0u64, trace.total_bytes),
+                    SpillMode::NoKeySpilling => (0u64, trace.total_value_bytes),
+                };
+                for i in 0..cli.cap_points {
+                    let frac = if cli.cap_points > 1 { i as f64 / (cli.cap_points - 1) as f64 } else { 1.0 };
+                    let cap_bytes = min_bytes + (frac * (max_bytes - min_bytes) as f64).round() as u64;
+                    tasks.push((trace.clone(), policy.clone(), frac, cap_bytes, mode));
+                }
             }
         }
     }
@@ -218,33 +286,39 @@ fn main() {
 
     let results: Vec<TaskResult> = tasks
         .par_iter()
-        .map(|(trace, policy, frac, cap)| simulate_one(trace, *cap, *frac, policy))
+        .map(|(trace, policy, frac, cap, mode)| simulate_one(trace, *cap, *frac, policy, *mode))
         .collect();
 
     let elapsed = start.elapsed();
     eprintln!("Done in {:.1}s", elapsed.as_secs_f64());
 
-    // Write CSV per policy
+    // Write CSV per policy per mode
     for policy in &cli.policy {
-        let safe = policy.replace('-', "_");
-        let path = cli.output.join(format!("{safe}_mrc_curves.csv"));
-        let mut wtr = WriterBuilder::new().from_path(&path).unwrap();
-        wtr.write_record(["workload", "policy", "measurement_mode",
-            "capacity_fraction_of_unique_bytes", "capacity_bytes",
-            "unique_objects_in_trace", "unique_value_bytes_in_trace",
-            "total_accesses", "object_miss_ratio", "byte_miss_ratio"]).unwrap();
+        for &mode in &modes {
+            let safe_policy = policy.replace('-', "_");
+            let safe_mode = mode.label().replace('-', "_");
+            let path = cli.output.join(format!("{safe_policy}_{safe_mode}_mrc_curves.csv"));
+            let mut wtr = WriterBuilder::new().from_path(&path).unwrap();
+            wtr.write_record(["workload", "policy", "mode", "measurement_mode",
+                "capacity_fraction", "capacity_bytes",
+                "total_key_bytes", "total_value_bytes", "total_bytes",
+                "unique_objects_in_trace",
+                "total_accesses", "object_miss_ratio", "byte_miss_ratio"]).unwrap();
 
-        for r in &results {
-            if r.policy != *policy { continue; }
-            wtr.write_record(&[
-                &r.workload, &r.policy, "exclude-first-touch",
-                &format!("{:.6}", r.cap_frac), &r.cap_bytes.to_string(),
-                &r.n_unique.to_string(), &r.unique_bytes.to_string(),
-                &r.total_accesses.to_string(),
-                &format!("{:.8}", r.obj_miss_ratio), &format!("{:.8}", r.byte_miss_ratio),
-            ]).unwrap();
+            for r in &results {
+                if r.policy != *policy || r.mode != mode { continue; }
+                wtr.write_record(&[
+                    &r.workload, &r.policy, mode.label(), "exclude-first-touch",
+                    &format!("{:.6}", r.cap_frac), &r.cap_bytes.to_string(),
+                    &r.total_key_bytes.to_string(), &r.total_value_bytes.to_string(),
+                    &r.total_bytes.to_string(),
+                    &r.n_unique.to_string(),
+                    &r.total_accesses.to_string(),
+                    &format!("{:.8}", r.obj_miss_ratio), &format!("{:.8}", r.byte_miss_ratio),
+                ]).unwrap();
+            }
+            wtr.flush().unwrap();
+            eprintln!("Wrote {}", path.display());
         }
-        wtr.flush().unwrap();
-        eprintln!("Wrote {}", path.display());
     }
 }

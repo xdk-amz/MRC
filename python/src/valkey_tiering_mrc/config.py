@@ -27,6 +27,7 @@ class ValueSizesConfig:
     small_sizes: list[int] = field(default_factory=list)
     medium_sizes: list[int] = field(default_factory=list)
     large_sizes: list[int] = field(default_factory=list)
+    key_value_ratio: str = "1:4"  # key_size = value_size / ratio_denominator
 
 
 @dataclass
@@ -74,6 +75,7 @@ def _from_dict(data: dict[str, Any]) -> HarnessConfig:
             small_sizes=list(vs.get("small_sizes", [])),
             medium_sizes=list(vs.get("medium_sizes", [])),
             large_sizes=list(vs.get("large_sizes", [])),
+            key_value_ratio=str(vs.get("key_value_ratio", "1:4")),
         ),
         workloads=dict(wl),
     )
