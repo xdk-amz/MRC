@@ -1,3 +1,7 @@
+// MRC Simulator — see DESIGN.md for capacity sweep semantics.
+// Key invariant: no-key-spilling sweeps [total_key_bytes, total_bytes],
+// policy_cap = cap_bytes - total_key_bytes. Never sweep below total_key_bytes.
+
 use clap::Parser;
 use csv::WriterBuilder;
 use rayon::prelude::*;
@@ -45,6 +49,10 @@ struct Cli {
     /// Spill mode: key-spilling, no-key-spilling, both
     #[arg(short, long, default_value = "both")]
     mode: String,
+
+    /// Fixed per-key DRAM overhead in bytes (dictEntry + robj, not captured in trace)
+    #[arg(long, default_value = "0")]
+    key_overhead: u64,
 }
 
 struct Trace {
@@ -58,7 +66,7 @@ struct Trace {
     n_unique: usize,
 }
 
-fn load_trace(path: &PathBuf) -> Trace {
+fn load_trace(path: &PathBuf, key_overhead: u64) -> Trace {
     let workload = path.file_stem().unwrap().to_string_lossy().to_string();
 
     let first_line = {
@@ -125,6 +133,13 @@ fn load_trace(path: &PathBuf) -> Trace {
         }
     }
 
+    // Add per-key overhead to key sizes
+    if key_overhead > 0 {
+        for ks in key_sizes.iter_mut() {
+            *ks += key_overhead;
+        }
+    }
+
     // Compute unique key/value bytes (first occurrence of each key)
     let mut first_key_size: FxHashMap<u64, u64> = FxHashMap::default();
     let mut first_value_size: FxHashMap<u64, u64> = FxHashMap::default();
@@ -188,7 +203,12 @@ fn simulate_one(
     policy_name: &str,
     mode: SpillMode,
 ) -> TaskResult {
-    let mut policy = make_policy(policy_name, cap_bytes);
+    // cap_bytes = total DRAM budget; for no-key-spilling, subtract fixed key cost
+    let policy_cap = match mode {
+        SpillMode::KeySpilling => cap_bytes,
+        SpillMode::NoKeySpilling => cap_bytes.saturating_sub(trace.total_key_bytes),
+    };
+    let mut policy = make_policy(policy_name, policy_cap);
 
     let mut seen = FxHashSet::default();
     let mut obj_miss: u64 = 0;
@@ -256,7 +276,7 @@ fn main() {
     // Load traces
     let traces: Vec<Arc<Trace>> = cli.traces.iter().map(|p| {
         eprintln!("Loading {}...", p.display());
-        let t = load_trace(p);
+        let t = load_trace(p, cli.key_overhead);
         eprintln!("  {} events, {} unique keys, {} key bytes, {} value bytes, {} total bytes",
             t.keys.len(), t.n_unique, t.total_key_bytes, t.total_value_bytes, t.total_bytes);
         Arc::new(t)
@@ -268,9 +288,11 @@ fn main() {
         for policy in &cli.policy {
             for &mode in &modes {
                 // Capacity sweep range depends on mode
+                // key-spilling: 0 -> total (keys can be evicted)
+                // no-key-spilling: total_key -> total (keys always resident)
                 let (min_bytes, max_bytes) = match mode {
                     SpillMode::KeySpilling => (0u64, trace.total_bytes),
-                    SpillMode::NoKeySpilling => (0u64, trace.total_value_bytes),
+                    SpillMode::NoKeySpilling => (trace.total_key_bytes, trace.total_bytes),
                 };
                 for i in 0..cli.cap_points {
                     let frac = if cli.cap_points > 1 { i as f64 / (cli.cap_points - 1) as f64 } else { 1.0 };
