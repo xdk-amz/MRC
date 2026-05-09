@@ -43,7 +43,7 @@ This creates a "dead zone" — DRAM that can never be reclaimed regardless of ac
 
 Data tiering (with or without key spilling) requires workloads with access skew — a "hot" subset of keys that can stay in DRAM while "cold" keys move to SSD. The following chart shows the access frequency distribution for each workload:
 
-![Workload Access Patterns](out/plots/workload_access_patterns.png)
+![Workload Access Patterns](workload_access_patterns.png)
 
 **How to read these charts:** A steep curve means a small number of keys handle most traffic (great for tiering). A flat line means all keys are accessed equally (tiering can't help regardless of key spilling).
 
