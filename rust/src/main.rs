@@ -53,6 +53,14 @@ struct Cli {
     /// Fixed per-key DRAM overhead in bytes (dictEntry + robj, not captured in trace)
     #[arg(long, default_value = "0")]
     key_overhead: u64,
+
+    /// Include first-touch accesses in miss ratio (counts compulsory misses)
+    #[arg(long, default_value = "false")]
+    include_first_touch: bool,
+
+    /// Per-key DRAM overhead for storage index when key is spilled (key-spilling mode only)
+    #[arg(long, default_value = "16")]
+    key_spill_overhead: u64,
 }
 
 struct Trace {
@@ -202,10 +210,13 @@ fn simulate_one(
     cap_frac: f64,
     policy_name: &str,
     mode: SpillMode,
+    include_first_touch: bool,
+    key_spill_overhead: u64,
 ) -> TaskResult {
     // cap_bytes = total DRAM budget; for no-key-spilling, subtract fixed key cost
+    // For key-spilling, subtract the irreducible index overhead (always resident)
     let policy_cap = match mode {
-        SpillMode::KeySpilling => cap_bytes,
+        SpillMode::KeySpilling => cap_bytes.saturating_sub(key_spill_overhead * trace.n_unique as u64),
         SpillMode::NoKeySpilling => cap_bytes.saturating_sub(trace.total_key_bytes),
     };
     let mut policy = make_policy(policy_name, policy_cap);
@@ -219,12 +230,12 @@ fn simulate_one(
     for t in 0..trace.keys.len() {
         let k = trace.keys[t];
         let entry_size = match mode {
-            SpillMode::KeySpilling => trace.key_sizes[t] + trace.value_sizes[t],
+            SpillMode::KeySpilling => (trace.key_sizes[t] + trace.value_sizes[t]).saturating_sub(key_spill_overhead),
             SpillMode::NoKeySpilling => trace.value_sizes[t],
         };
         let first_touch = seen.insert(k);
         let hit = policy.access(k, entry_size, t as u64);
-        if first_touch {
+        if first_touch && !include_first_touch {
             continue;
         }
         measured += 1;
@@ -291,7 +302,7 @@ fn main() {
                 // key-spilling: 0 -> total (keys can be evicted)
                 // no-key-spilling: total_key -> total (keys always resident)
                 let (min_bytes, max_bytes) = match mode {
-                    SpillMode::KeySpilling => (0u64, trace.total_bytes),
+                    SpillMode::KeySpilling => (cli.key_spill_overhead * trace.n_unique as u64, trace.total_bytes),
                     SpillMode::NoKeySpilling => (trace.total_key_bytes, trace.total_bytes),
                 };
                 for i in 0..cli.cap_points {
@@ -308,7 +319,7 @@ fn main() {
 
     let results: Vec<TaskResult> = tasks
         .par_iter()
-        .map(|(trace, policy, frac, cap, mode)| simulate_one(trace, *cap, *frac, policy, *mode))
+        .map(|(trace, policy, frac, cap, mode)| simulate_one(trace, *cap, *frac, policy, *mode, cli.include_first_touch, cli.key_spill_overhead))
         .collect();
 
     let elapsed = start.elapsed();
@@ -330,7 +341,7 @@ fn main() {
             for r in &results {
                 if r.policy != *policy || r.mode != mode { continue; }
                 wtr.write_record(&[
-                    &r.workload, &r.policy, mode.label(), "exclude-first-touch",
+                    &r.workload, &r.policy, mode.label(), &(if cli.include_first_touch { "include-first-touch".to_string() } else { "exclude-first-touch".to_string() }),
                     &format!("{:.6}", r.cap_frac), &r.cap_bytes.to_string(),
                     &r.total_key_bytes.to_string(), &r.total_value_bytes.to_string(),
                     &r.total_bytes.to_string(),

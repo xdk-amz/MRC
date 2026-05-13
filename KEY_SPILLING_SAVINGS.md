@@ -217,6 +217,49 @@ The trace exhibits strong Zipfian-like access skew: only 12% of data in DRAM cap
 
 ---
 
+## Storage-Layer Key Overhead
+
+### The Hidden Cost of Key Spilling
+
+All results above assume **0 bytes of per-key overhead** when a key is spilled to SSD — i.e., evicting a key frees its entire allocation from DRAM. In practice, the storage layer (e.g., RocksDB) maintains an **in-memory index** to locate spilled keys on disk. This index entry has a fixed per-key cost that remains in DRAM even when the key itself is on SSD.
+
+This means key spilling's true DRAM floor is not 0% — it's:
+
+```
+Minimum DRAM (key-spilling) = overhead_per_key × number_of_unique_keys
+```
+
+For the Twitter trace (1.6M keys):
+- **0B overhead** (ideal): floor = 0% of total data
+- **16B overhead**: floor = 6.1% of total data (24.7 MB)
+
+### Impact on MRC Curves
+
+The storage index overhead shifts the key-spilling MRC curve to the right — more DRAM is needed to achieve the same miss ratio. The effect is a constant offset equal to the overhead floor, since those bytes can never be reclaimed regardless of eviction policy.
+
+![Storage Index Overhead Impact](key_spill_overhead_impact.png)
+
+### Quantified Impact (Twitter Trace, allkeys-lru)
+
+| Per-Key Overhead | DRAM Floor | DRAM at 8% Miss | DRAM Savings vs NKS |
+|------------------|-----------|-----------------|---------------------|
+| **0B** (ideal) | 0.0% | 11.6% | 16.2 pp |
+| **16B** (realistic) | 6.1% | 17.0% | 10.8 pp |
+| No Key Spilling (10% target) | 20.8% | 27.8% | — (baseline) |
+
+### Interpretation
+
+Even with a realistic 16B per-key index overhead, key spilling still reduces DRAM requirements by **10.8 percentage points** (from 27.8% to 17.0%) — a **39% reduction** in DRAM needed. The overhead erodes roughly one-third of the ideal savings (16.2pp → 10.8pp), but key spilling remains strongly beneficial.
+
+The 16B estimate is conservative and accounts for a typical hash-table index entry in the storage backend (8B hash + 8B file offset). Actual overhead depends on the storage engine:
+- **RocksDB block cache index**: ~10–16B per key (bloom filter bits + index block pointers)
+- **Custom hash index**: 8–24B per key depending on collision strategy
+- **B-tree index**: ~12–20B per key amortized
+
+> **Note:** All MRC results in the sections above were generated with 0B key-spill overhead. The dollar savings figures represent the upper bound. With 16B overhead, the Twitter trace savings reduce from $14.31 to approximately **$10.80 per $100 baseline** — still substantial.
+
+---
+
 ## Methodology
 
 - **Simulator**: Custom MRC (Miss Ratio Curve) simulator using allkeys-lru eviction policy (matches Valkey's default)
@@ -226,3 +269,4 @@ The trace exhibits strong Zipfian-like access skew: only 12% of data in DRAM cap
 - **Cost model**: 10:1 DRAM:SSD cost ratio ($1/unit DRAM, $0.10/unit SSD)
 - **Miss ratio targets**: 8% for key-spilling, 10% for non-key-spilling (accounts for ~20% SSD overhead with key spilling)
 - **Key:Value ratios tested**: 1:4 (Km=20%), 1:2 (Km=33%), 1:1 (Km=50%), plus real-world 1:3.8 (Twitter)
+- **Storage index overhead**: 0B for main results (upper-bound savings); sensitivity analysis at 0B and 16B per key in the "Storage-Layer Key Overhead" section
