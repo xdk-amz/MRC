@@ -15,6 +15,9 @@ use policies::{AllkeysLfu, AllkeysLru, AllkeysRandom, Fifo, S3Fifo, TrueLru, Evi
 mod promotion;
 use promotion::{PromotionPolicy, AlwaysPromote, NeverPromote, SecondHit, RecentReuse};
 
+mod admission;
+use admission::{AdmissionPolicy, AdmitToDram, AdmitToFlash};
+
 #[derive(Clone, Copy, PartialEq)]
 enum SpillMode {
     KeySpilling,
@@ -44,6 +47,10 @@ struct Cli {
     /// Promotion policies: always, never, second-hit-N, reuse-within-N
     #[arg(long, value_delimiter = ',', default_value = "always")]
     promotion: Vec<String>,
+
+    /// Admission policies: admit-dram, admit-flash
+    #[arg(long, value_delimiter = ',', default_value = "admit-dram")]
+    admission: Vec<String>,
 
     /// Number of capacity points
     #[arg(short = 'n', long, default_value = "21")]
@@ -169,6 +176,7 @@ struct TaskResult {
     workload: String,
     policy: String,
     promotion_policy: String,
+    admission_policy: String,
     mode: SpillMode,
     cap_frac: f64,
     cap_bytes: u64,
@@ -228,6 +236,14 @@ fn make_promotion(name: &str) -> Box<dyn PromotionPolicy> {
     }
 }
 
+fn make_admission(name: &str) -> Box<dyn AdmissionPolicy> {
+    match name {
+        "admit-dram" => Box::new(AdmitToDram),
+        "admit-flash" => Box::new(AdmitToFlash),
+        _ => panic!("unknown admission policy: {name} (valid: admit-dram, admit-flash)"),
+    }
+}
+
 /// Two-tier simulation: DRAM (eviction policy) + Flash (infinite capacity).
 ///
 /// Flow per access:
@@ -242,6 +258,7 @@ fn simulate_two_tier(
     cap_frac: f64,
     policy_name: &str,
     promotion_name: &str,
+    admission_name: &str,
     mode: SpillMode,
     include_first_touch: bool,
     key_spill_overhead: u64,
@@ -253,6 +270,7 @@ fn simulate_two_tier(
 
     let mut policy = make_policy(policy_name, policy_cap);
     let mut promo = make_promotion(promotion_name);
+    let mut admit = make_admission(admission_name);
 
     // Flash tier: tracks keys that were evicted from DRAM
     let mut flash: FxHashSet<u64> = FxHashSet::default();
@@ -308,11 +326,16 @@ fn simulate_two_tier(
             continue;
         }
 
-        // 3. True miss — admit to DRAM
-        let evicted = policy.admit(k, entry_size, t as u64);
-        evictions += evicted.len() as u64;
-        for ek in &evicted { *per_key_evictions.entry(*ek).or_insert(0) += 1; }
-        for ek in evicted { flash.insert(ek); }
+        // 3. True miss — admission policy decides DRAM or flash
+        if admit.admit_to_dram(k, t as u64) {
+            let evicted = policy.admit(k, entry_size, t as u64);
+            evictions += evicted.len() as u64;
+            for ek in &evicted { *per_key_evictions.entry(*ek).or_insert(0) += 1; }
+            for ek in evicted { flash.insert(ek); }
+        } else {
+            // Admit directly to flash
+            flash.insert(k);
+        }
 
         if first_touch && !include_first_touch { continue; }
         measured += 1;
@@ -338,6 +361,7 @@ fn simulate_two_tier(
         workload: trace.workload.clone(),
         policy: policy_name.to_string(),
         promotion_policy: promo.label(),
+        admission_policy: admit.label().to_string(),
         mode,
         cap_frac,
         cap_bytes,
@@ -398,19 +422,21 @@ fn main() {
     }).collect();
 
     // Build tasks: trace × policy × promotion × mode × capacity
-    let mut tasks: Vec<(Arc<Trace>, String, String, f64, u64, SpillMode)> = Vec::new();
+    let mut tasks: Vec<(Arc<Trace>, String, String, String, f64, u64, SpillMode)> = Vec::new();
     for trace in &traces {
         for policy in &cli.policy {
             for promo in &cli.promotion {
-                for &mode in &modes {
-                    let (min_bytes, max_bytes) = match mode {
-                        SpillMode::KeySpilling => (cli.key_spill_overhead * trace.n_unique as u64, trace.total_bytes),
-                        SpillMode::NoKeySpilling => (trace.total_key_bytes, trace.total_bytes),
-                    };
-                    for i in 0..cli.cap_points {
-                        let frac = if cli.cap_points > 1 { i as f64 / (cli.cap_points - 1) as f64 } else { 1.0 };
-                        let cap_bytes = min_bytes + (frac * (max_bytes - min_bytes) as f64).round() as u64;
-                        tasks.push((trace.clone(), policy.clone(), promo.clone(), frac, cap_bytes, mode));
+                for admit in &cli.admission {
+                    for &mode in &modes {
+                        let (min_bytes, max_bytes) = match mode {
+                            SpillMode::KeySpilling => (cli.key_spill_overhead * trace.n_unique as u64, trace.total_bytes),
+                            SpillMode::NoKeySpilling => (trace.total_key_bytes, trace.total_bytes),
+                        };
+                        for i in 0..cli.cap_points {
+                            let frac = if cli.cap_points > 1 { i as f64 / (cli.cap_points - 1) as f64 } else { 1.0 };
+                            let cap_bytes = min_bytes + (frac * (max_bytes - min_bytes) as f64).round() as u64;
+                            tasks.push((trace.clone(), policy.clone(), promo.clone(), admit.clone(), frac, cap_bytes, mode));
+                        }
                     }
                 }
             }
@@ -424,61 +450,64 @@ fn main() {
 
     let results: Vec<TaskResult> = tasks
         .par_iter()
-        .map(|(trace, policy, promo, frac, cap, mode)| {
-            simulate_two_tier(trace, *cap, *frac, policy, promo, *mode, include_ft, kso)
+        .map(|(trace, policy, promo, admit, frac, cap, mode)| {
+            simulate_two_tier(trace, *cap, *frac, policy, promo, admit, *mode, include_ft, kso)
         })
         .collect();
 
     let elapsed = start.elapsed();
     eprintln!("Done in {:.1}s", elapsed.as_secs_f64());
 
-    // Write CSV per policy × promotion × mode
+    // Write CSV per policy × promotion × admission × mode
     for policy in &cli.policy {
         for promo in &cli.promotion {
-            for &mode in &modes {
-                let safe_policy = policy.replace('-', "_");
-                let safe_promo = promo.replace('-', "_");
-                let safe_mode = mode.label().replace('-', "_");
-                let path = cli.output.join(format!("{safe_policy}_{safe_mode}_promo_{safe_promo}_mrc_curves.csv"));
-                let mut wtr = WriterBuilder::new().from_path(&path).unwrap();
-                wtr.write_record(["workload", "policy", "promotion_policy", "mode", "measurement_mode",
-                    "capacity_fraction", "capacity_bytes",
-                    "total_key_bytes", "total_value_bytes", "total_bytes",
-                    "unique_objects_in_trace",
-                    "total_accesses", "object_miss_ratio", "byte_miss_ratio",
-                    "flash_hit_ratio", "promotions", "flash_hits",
-                    "evictions", "keys_ever_evicted", "keys_ever_promoted",
-                    "max_evictions_per_key", "max_promotions_per_key",
-                    "keys_evicted_gt1", "keys_promoted_gt1"]).unwrap();
+            for admit in &cli.admission {
+                for &mode in &modes {
+                    let safe_policy = policy.replace('-', "_");
+                    let safe_promo = promo.replace('-', "_");
+                    let safe_admit = admit.replace('-', "_");
+                    let safe_mode = mode.label().replace('-', "_");
+                    let path = cli.output.join(format!("{safe_policy}_{safe_mode}_{safe_admit}_promo_{safe_promo}_mrc_curves.csv"));
+                    let mut wtr = WriterBuilder::new().from_path(&path).unwrap();
+                    wtr.write_record(["workload", "policy", "promotion_policy", "admission_policy", "mode", "measurement_mode",
+                        "capacity_fraction", "capacity_bytes",
+                        "total_key_bytes", "total_value_bytes", "total_bytes",
+                        "unique_objects_in_trace",
+                        "total_accesses", "object_miss_ratio", "byte_miss_ratio",
+                        "flash_hit_ratio", "promotions", "flash_hits",
+                        "evictions", "keys_ever_evicted", "keys_ever_promoted",
+                        "max_evictions_per_key", "max_promotions_per_key",
+                        "keys_evicted_gt1", "keys_promoted_gt1"]).unwrap();
 
-                for r in &results {
-                    if r.policy != *policy || r.promotion_policy != *promo || r.mode != mode { continue; }
-                    let mmode = if include_ft { "include-first-touch" } else { "exclude-first-touch" };
-                    wtr.write_record(&[
-                        &r.workload, &r.policy, &r.promotion_policy, mode.label(), mmode,
-                        &format!("{:.6}", r.cap_frac), &r.cap_bytes.to_string(),
-                        &r.total_key_bytes.to_string(), &r.total_value_bytes.to_string(),
-                        &r.total_bytes.to_string(), &r.n_unique.to_string(),
-                        &r.total_accesses.to_string(),
-                        &format!("{:.8}", r.obj_miss_ratio), &format!("{:.8}", r.byte_miss_ratio),
-                        &format!("{:.8}", r.flash_hit_ratio),
-                        &r.promotions.to_string(), &r.flash_hits.to_string(),
-                        &r.evictions.to_string(), &r.keys_ever_evicted.to_string(),
-                        &r.keys_ever_promoted.to_string(),
-                        &r.max_evictions_per_key.to_string(), &r.max_promotions_per_key.to_string(),
-                        &r.keys_evicted_gt1.to_string(), &r.keys_promoted_gt1.to_string(),
-                    ]).unwrap();
+                    for r in &results {
+                        if r.policy != *policy || r.promotion_policy != *promo || r.admission_policy != *admit || r.mode != mode { continue; }
+                        let mmode = if include_ft { "include-first-touch" } else { "exclude-first-touch" };
+                        wtr.write_record(&[
+                            &r.workload, &r.policy, &r.promotion_policy, &r.admission_policy, mode.label(), mmode,
+                            &format!("{:.6}", r.cap_frac), &r.cap_bytes.to_string(),
+                            &r.total_key_bytes.to_string(), &r.total_value_bytes.to_string(),
+                            &r.total_bytes.to_string(), &r.n_unique.to_string(),
+                            &r.total_accesses.to_string(),
+                            &format!("{:.8}", r.obj_miss_ratio), &format!("{:.8}", r.byte_miss_ratio),
+                            &format!("{:.8}", r.flash_hit_ratio),
+                            &r.promotions.to_string(), &r.flash_hits.to_string(),
+                            &r.evictions.to_string(), &r.keys_ever_evicted.to_string(),
+                            &r.keys_ever_promoted.to_string(),
+                            &r.max_evictions_per_key.to_string(), &r.max_promotions_per_key.to_string(),
+                            &r.keys_evicted_gt1.to_string(), &r.keys_promoted_gt1.to_string(),
+                        ]).unwrap();
+                    }
+                    wtr.flush().unwrap();
+                    eprintln!("Wrote {}", path.display());
                 }
-                wtr.flush().unwrap();
-                eprintln!("Wrote {}", path.display());
             }
         }
     }
 
-    // Also write a combined CSV for easy comparison
+    // Combined CSV
     let combined_path = cli.output.join("promotion_sweep_combined.csv");
     let mut wtr = WriterBuilder::new().from_path(&combined_path).unwrap();
-    wtr.write_record(["workload", "policy", "promotion_policy", "mode", "measurement_mode",
+    wtr.write_record(["workload", "policy", "promotion_policy", "admission_policy", "mode", "measurement_mode",
         "capacity_fraction", "capacity_bytes",
         "total_key_bytes", "total_value_bytes", "total_bytes",
         "unique_objects_in_trace",
@@ -490,7 +519,7 @@ fn main() {
     for r in &results {
         let mmode = if include_ft { "include-first-touch" } else { "exclude-first-touch" };
         wtr.write_record(&[
-            &r.workload, &r.policy, &r.promotion_policy, r.mode.label(), mmode,
+            &r.workload, &r.policy, &r.promotion_policy, &r.admission_policy, r.mode.label(), mmode,
             &format!("{:.6}", r.cap_frac), &r.cap_bytes.to_string(),
             &r.total_key_bytes.to_string(), &r.total_value_bytes.to_string(),
             &r.total_bytes.to_string(), &r.n_unique.to_string(),
