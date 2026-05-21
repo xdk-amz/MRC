@@ -457,9 +457,7 @@ impl S3Fifo {
     pub fn with_params(capacity_bytes: u64, small_ratio: f64, ghost_ratio: f64, _threshold: u8) -> Self {
         let small_target = (capacity_bytes as f64 * small_ratio).max(1.0) as u64;
         let main_target = capacity_bytes.saturating_sub(small_target);
-        let ghost_target = if capacity_bytes > 0 {
-            (capacity_bytes as f64 * ghost_ratio / 17000.0).max(100.0) as usize
-        } else { 100 };
+        let ghost_target = 0; // lazily set on first admit when value_size is known
         Self {
             capacity: capacity_bytes, small_target, main_target,
             small_bytes: 0, small_queue: VecDeque::new(), small_freq: FxHashMap::default(),
