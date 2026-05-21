@@ -10,18 +10,20 @@ This report evaluates six representative workload patterns and one production tr
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| **Key:Value size ratio** | 1:2 | Conservative — larger values (1:4, 1:10) benefit *more* from tiering since a larger fraction of data is evictable. We deliberately chose a small ratio to show minimum expected savings. |
-| **Cost model** | 10:1 DRAM:SSD | $1/unit DRAM vs $0.10/unit SSD — representative of cloud instance pricing (e.g., r6g vs i3/d3 storage-optimized) |
-| **Eviction policies** | allkeys-lru, allkeys-lfu, allkeys-random, S3-FIFO | The `allkeys-*` policies are Valkey's built-in eviction policies (sampled with 5 candidates). **S3-FIFO** is included as an example of a possible future policy — it is not currently available in Valkey but demonstrates the potential of scan-resistant admission filters. |
+| **Key size** | 100 bytes (fixed) | Uniform across all keys — eliminates size-skew artifacts |
+| **Value size** | 200 bytes (fixed) | Uniform across all keys — isolates access pattern effects |
+| **Key:Value size ratio** | 1:2 | Km = 33%. Conservative — larger values (1:4, 1:10) benefit *more* from tiering. |
+| **Cost model** | 10:1 DRAM:SSD | $1/unit DRAM vs $0.10/unit SSD — representative of cloud instance pricing |
+| **Eviction policies** | allkeys-lru, allkeys-lfu, allkeys-random, S3-FIFO | The `allkeys-*` policies are Valkey's built-in eviction policies (sampled with 5 candidates). **S3-FIFO** is a scan-resistant policy using a small FIFO + main FIFO + ghost queue. |
 | **Trace length** | 10M events | Sufficient for steady-state convergence |
 | **Unique keys** | 1M (synthetic), 1.6M (Twitter) | |
 
 **Key findings:**
-- Workloads with strong access skew (Zipfian, hot core) can reduce DRAM to **36–51% of total data** at a 20% miss ratio target, or **40–69%** at a stricter 10% target
-- Workloads without skew (uniform, sequential) see **minimal benefit** — they need 84–97% DRAM regardless of policy
-- **S3-FIFO** and **allkeys-lru** are the best general-purpose policies
+- Workloads with strong access skew (Zipfian, hot core) can reduce DRAM to **35–43% of total data** at a 20% miss ratio target, or **41–65%** at a stricter 10% target
+- Workloads without skew (uniform, sequential) see **minimal benefit** — they need 85–99% DRAM regardless of policy
+- **S3-FIFO** is the best general-purpose policy — it reaches miss targets with less DRAM than LRU on Zipfian and scan-heavy workloads
+- **allkeys-lru** is a close second and simpler to implement
 - A production Twitter cache trace achieves **<10% miss at just 28% DRAM** — confirming that real-world caching workloads are excellent tiering candidates
-- With a larger key:value ratio (e.g., 1:4), savings would be even greater since Km drops from 33% to 20%, making more data evictable
 
 > **Note on miss ratio targets**: The 10% and 20% miss ratio targets used throughout this document are estimates. The actual acceptable miss ratio for a deployment is a function of (1) the throughput of the workload (ops/sec), (2) the latency characteristics of the storage/tiering layer (SSD read latency, queue depth), and (3) the application's tail latency budget. A workload doing 10K ops/s with a 1ms SSD read may tolerate 20% misses, while a workload doing 500K ops/s with the same SSD would need ≤5% misses to avoid saturating the storage layer.
 
@@ -106,20 +108,20 @@ A **Miss Ratio Curve (MRC)** shows how miss ratio decreases as DRAM increases. T
 
 | Workload | Target | allkeys-lru | allkeys-lfu | allkeys-random | s3-fifo | Verdict |
 |----------|--------|-------------|-------------|----------------|---------|---------|
-| **Zipfian Hot Set** | 20% | 36.6% | 37.6% | 37.7% | 36.4% | ✓ Excellent |
-| | 10% | 44.6% | 48.2% | 48.2% | 39.9% | |
-| **Hot Core + Tail** | 20% | 51.0% | 48.5% | 48.5% | 45.2% | ✓ Excellent |
-| | 10% | 69.0% | 69.0% | 68.9% | 69.2% | |
-| **Rotating Hot Sets** | 20% | 66.0% | 65.3% | 65.3% | 62.1% | ~ Moderate |
-| | 10% | 71.3% | 74.6% | 74.6% | 66.9% | |
-| **Hot Set + Scans** | 20% | 72.8% | 64.9% | 63.9% | 61.6% | ~ Moderate |
-| | 10% | 80.0% | 79.2% | 79.1% | 77.5% | |
-| **Uniform Random** | 20% | 84.2% | 84.2% | 84.1% | 84.2% | ✗ Poor |
-| | 10% | 91.4% | 91.4% | 91.4% | 91.4% | |
-| **Sequential Scan** | 20% | 97.5% | 93.1% | 93.1% | 96.5% | ✗ Poor |
-| | 10% | 98.8% | 96.6% | 96.6% | 98.3% | |
+| **Zipfian Hot Set** | 20% | 37% | 37% | 39% | 35% | ✓ Excellent |
+| | 10% | 45% | 48% | 48% | 41% | |
+| **Hot Core + Tail** | 20% | 43% | 45% | 45% | 43% | ✓ Excellent |
+| | 10% | 65% | 65% | 65% | 65% | |
+| **Rotating Hot Sets** | 20% | 67% | 65% | 65% | 68% | ~ Moderate |
+| | 10% | 72% | 75% | 75% | 76% | |
+| **Hot Set + Scans** | 20% | 76% | 65% | 65% | 67% | ~ Moderate |
+| | 10% | 92% | 85% | 85% | 87% | |
+| **Uniform Random** | 20% | 85% | 85% | 85% | 85% | ✗ Poor |
+| | 10% | 92% | 92% | 92% | 92% | |
+| **Sequential Scan** | 20% | 99% | 93% | 93% | 97% | ✗ Poor |
+| | 10% | 100% | 97% | 97% | 100% | |
 
-*All values are % of total data that must remain in DRAM. Lower = more savings. Key:Value ratio = 1:2 (Km = 33%).*
+*All values are % of total data that must remain in DRAM. Lower = more savings. Fixed 100B keys, 200B values (Km = 33%).*
 
 ---
 
@@ -131,23 +133,23 @@ A **Miss Ratio Curve (MRC)** shows how miss ratio decreases as DRAM increases. T
 
 **Why tiering works**: The top ~5% of keys handle 65%+ of traffic. A small DRAM cache captures most hits. The remaining 95% of keys can live on SSD with minimal miss impact.
 
-**Best policy**: S3-FIFO (36.4% at 20%, 39.9% at 10%) — its admission filter prevents one-hit-wonders from polluting the main cache. allkeys-lru (36.6%/44.6%) is a close second.
+**Best policy**: S3-FIFO (35% at 20%, 41% at 10%) — its ghost queue identifies frequently-accessed keys and promotes them to the protected main queue. allkeys-lru (37%/45%) is a close second.
 
-**DRAM savings at 20% target**: 63% of data moves to SSD.
-**DRAM savings at 10% target**: 55–60% of data moves to SSD (policy-dependent).
+**DRAM savings at 20% target**: 63–65% of data moves to SSD.
+**DRAM savings at 10% target**: 55–59% of data moves to SSD.
 
 ---
 
 ### ✓ Excellent: Hot Core + Noisy Tail
 
-**Pattern**: A small core of ~10K keys gets 70% of traffic, with a long tail of 960K rarely-accessed keys (recommendation engines, user profile caches).
+**Pattern**: A small core of ~10K keys gets 70% of traffic, with a long tail of 900K rarely-accessed keys (recommendation engines, user profile caches).
 
 **Why tiering works**: The hot core is tiny and stable — it fits easily in a small DRAM allocation. The long tail is almost never accessed and can be entirely on SSD.
 
-**Best policy**: S3-FIFO (45.2% at 20%) — filters tail accesses effectively. At the stricter 10% target, all policies converge (~69%) because the tail's sequential scan pattern requires more DRAM to absorb.
+**Best policy**: S3-FIFO and allkeys-lru tied (43% at 20%). At the stricter 10% target, all policies converge (~65%) because the tail noise requires more DRAM to absorb.
 
-**DRAM savings at 20% target**: 49–55% of data moves to SSD.
-**DRAM savings at 10% target**: ~31% of data moves to SSD — still meaningful but the gap between targets is large, indicating sensitivity to the tail scan pattern.
+**DRAM savings at 20% target**: 55–57% of data moves to SSD.
+**DRAM savings at 10% target**: ~35% of data moves to SSD.
 
 ---
 
@@ -157,10 +159,10 @@ A **Miss Ratio Curve (MRC)** shows how miss ratio decreases as DRAM increases. T
 
 **Why tiering partially works**: At any given moment, only one hot set is active and fits in DRAM. But when the hot set rotates, the cache must flush old entries and warm up new ones — causing burst misses during transitions.
 
-**Best policy**: S3-FIFO (62.1% at 20%, 66.9% at 10%) handles rotation well. allkeys-lru (66.0%/71.3%) adapts quickly to new hot sets via recency.
+**Best policy**: allkeys-lfu and allkeys-random (65% at 20%) adapt to rotation. allkeys-lru (67%) is slightly worse. S3-FIFO (68%) struggles because its ghost queue remembers old hot sets that are no longer relevant.
 
-**DRAM savings at 20% target**: 34–38% of data moves to SSD.
-**DRAM savings at 10% target**: 25–33% of data moves to SSD — marginal benefit.
+**DRAM savings at 20% target**: 32–35% of data moves to SSD.
+**DRAM savings at 10% target**: 24–28% of data moves to SSD — marginal benefit.
 
 ---
 
@@ -170,10 +172,10 @@ A **Miss Ratio Curve (MRC)** shows how miss ratio decreases as DRAM increases. T
 
 **Why tiering partially works**: The base workload is excellent for tiering, but periodic scans pollute the cache by promoting cold keys, temporarily evicting hot ones.
 
-**Best policy**: S3-FIFO (61.6% at 20%, 77.5% at 10%) — its small queue filters scan keys before they enter the main cache. allkeys-random (63.9%/79.1%) also resists scan pollution because eviction is independent of access order.
+**Best policy**: allkeys-lfu and allkeys-random (65% at 20%, 85% at 10%) resist scan pollution because frequency/randomness is independent of access order. S3-FIFO (67%/87%) also resists scans via its small queue filter. allkeys-lru (76%/92%) is worst — scans push hot keys out of the recency window.
 
-**DRAM savings at 20% target**: 27–38% of data moves to SSD (highly policy-dependent).
-**DRAM savings at 10% target**: 20–23% of data moves to SSD — scan resistance is critical.
+**DRAM savings at 20% target**: 24–35% of data moves to SSD (highly policy-dependent).
+**DRAM savings at 10% target**: 8–15% of data moves to SSD — scan resistance is critical.
 
 ---
 
@@ -181,11 +183,11 @@ A **Miss Ratio Curve (MRC)** shows how miss ratio decreases as DRAM increases. T
 
 **Pattern**: All keys equally likely at every instant (hash-based load balancing, random sampling workloads).
 
-**Why tiering fails**: No hot/cold separation exists. Every key has the same probability of being accessed next. Moving any subset to SSD guarantees proportional misses — there's no "safe" cold set.
+**Why tiering fails**: No hot/cold separation exists. Every key has the same probability of being accessed next. Moving any subset to SSD guarantees proportional misses — there’s no "safe" cold set.
 
-**All policies**: ~84% DRAM at 20% target, ~91% at 10% target. No policy can outperform another because there's no pattern to exploit.
+**All policies**: ~85% DRAM at 20% target, ~92% at 10% target. No policy can outperform another because there’s no pattern to exploit.
 
-**DRAM savings**: Minimal — only 16% moves to SSD at 20% target, and the miss ratio is still at the target threshold.
+**DRAM savings**: Minimal — only 15% moves to SSD at 20% target.
 
 ---
 
@@ -195,7 +197,7 @@ A **Miss Ratio Curve (MRC)** shows how miss ratio decreases as DRAM increases. T
 
 **Why tiering fails**: Every key is accessed exactly once per cycle. The working set at any moment equals the entire dataset. No subset is "cold" — every key will be needed again soon.
 
-**All policies**: 93–98% DRAM at 20% target, 97–99% at 10% target. LRU needs ~98% because it evicts the oldest entry, which is exactly the next one needed (Bélády's anomaly).
+**Best policy**: allkeys-lfu/random (93% at 20%, 97% at 10%) slightly outperform LRU (99%/100%) because LRU evicts the oldest entry, which is exactly the next one needed (Bélády’s anomaly). S3-FIFO (97%/100%) also suffers from this.
 
 **DRAM savings**: Essentially none. Sequential scans should bypass the cache entirely.
 
